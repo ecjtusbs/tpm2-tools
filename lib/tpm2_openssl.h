@@ -13,10 +13,6 @@
 
 #include "pcr.h"
 
-#if (OPENSSL_VERSION_NUMBER < 0x1010000fL && !defined(LIBRESSL_VERSION_NUMBER)) || (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x20700000L) /* OpenSSL 1.1.0 */
-#define LIB_TPM2_OPENSSL_OPENSSL_PRE11
-#endif
-
 #if OPENSSL_VERSION_NUMBER >= 0x10101000L
 #define EC_POINT_set_affine_coordinates_tss(group, tpm_pub_key, bn_x, bn_y, dmy) \
         EC_POINT_set_affine_coordinates(group, tpm_pub_key, bn_x, bn_y, dmy)
@@ -31,31 +27,6 @@
 #define EC_POINT_get_affine_coordinates_tss(group, tpm_pub_key, bn_x, bn_y, dmy) \
         EC_POINT_get_affine_coordinates_GFp(group, tpm_pub_key, bn_x, bn_y, dmy)
 #endif /* OPENSSL_VERSION_NUMBER >= 0x10101000L */
-
-#if defined(LIB_TPM2_OPENSSL_OPENSSL_PRE11)
-int RSA_set0_key(RSA *r, BIGNUM *n, BIGNUM *e, BIGNUM *d);
-void RSA_get0_factors(const RSA *r, const BIGNUM **p, const BIGNUM **q);
-int ECDSA_SIG_set0(ECDSA_SIG *sig, BIGNUM *r, BIGNUM *s);
-EVP_ENCODE_CTX *EVP_ENCODE_CTX_new(void);
-void EVP_ENCODE_CTX_free(EVP_ENCODE_CTX *ctx);
-#endif
-
-/**
- * Function prototype for a hashing routine.
- *
- * This is a wrapper around OSSL SHA256|384 and etc digesters.
- *
- * @param d
- *  The data to digest.
- * @param n
- *  The length of the data to digest.
- * @param md
- *  The output message digest.
- * @return
- * A pointer to the digest or NULL on error.
- */
-typedef unsigned char *(*digester)(const unsigned char *d, size_t n,
-        unsigned char *md);
 
 static inline const char *tpm2_openssl_get_err(void) {
     return ERR_error_string(ERR_get_error(), NULL);
@@ -77,21 +48,7 @@ int tpm2_openssl_halgid_from_tpmhalg(TPMI_ALG_HASH algorithm);
  * @return
  *  A pointer to a message digester or NULL on failure.
  */
-const EVP_MD *tpm2_openssl_halg_from_tpmhalg(TPMI_ALG_HASH algorithm);
-
-/**
- * Start an openssl hmac session.
- * @return
- *  A valid session pointer or NULL on error.
- */
-HMAC_CTX *tpm2_openssl_hmac_new();
-
-/**
- * Free an hmac context created via tpm2_openssl_hmac_new().
- * @param ctx
- *  The context to release resources of.
- */
-void tpm2_openssl_hmac_free(HMAC_CTX *ctx);
+const EVP_MD *tpm2_openssl_md_from_tpmhalg(TPMI_ALG_HASH algorithm);
 
 /**
  * Hash a byte buffer.
@@ -173,34 +130,6 @@ bool tpm2_openssl_hash_pcr_banks_le(TPMI_ALG_HASH hashAlg,
 bool tpm2_openssl_pcr_extend(TPMI_ALG_HASH halg, BYTE *pcr,
         const BYTE *data, UINT16 length);
 
-/**
- * Obtains an OpenSSL EVP_CIPHER_CTX dealing with version
- * API changes in OSSL.
- *
- * @return
- *  An Initialized OpenSSL EVP_CIPHER_CTX.
- */
-EVP_CIPHER_CTX *tpm2_openssl_cipher_new(void);
-
-/**
- * Free's an EVP_CIPHER_CTX obtained via tpm2_openssl_cipher_new()
- * dealing with OSSL API version changes.
- * @param ctx
- *  The EVP_CIPHER_CTX to free.
- */
-void tpm2_openssl_cipher_free(EVP_CIPHER_CTX *ctx);
-
-/**
- * Returns a function pointer capable of performing the
- * given digest from a TPMI_HASH_ALG.
- *
- * @param halg
- *  The hashing algorithm to use.
- * @return
- *  NULL on failure or a valid digester on success.
- */
-digester tpm2_openssl_halg_to_digester(TPMI_ALG_HASH halg);
-
 typedef enum tpm2_openssl_load_rc tpm2_openssl_load_rc;
 enum tpm2_openssl_load_rc {
     lprc_error = 0, /* an error has occurred */
@@ -224,21 +153,17 @@ static inline bool tpm2_openssl_did_load_public(
 }
 
 /**
- * Loads a private portion of a key, and possibly the public portion.
- * For asymmetric algorithms the public data is in  private PEM file.
- * For symmetric keys, the file type is raw. For asymmetric keys, the
- * file type is a PEM file.
- *
- * This ONLY supports AES, ECC and RSA.
- *
- * It populates the sensitive seed with a random value for symmetric keys.
+ * Loads a private portion of a key, and possibly the public portion, as for RSA the public data is in
+ * a private pem file.
  *
  * @param path
  *  The path to load from.
- * @param path
- *  The passphrase for the input file.
- * @param alg
- *  algorithm type to import.
+ * @param passin
+ *  If the path needs a password to decrypt like a password protected OpenSSL PEM file.
+ * @param object_auth
+ *  The auth value to set for the object, may be NULL.
+ * @param template
+ *  The public template to use to construct the TPM objects.
  * @param pub
  *  The public structure to populate. Note that nameAlg must be populated.
  * @param priv
@@ -248,9 +173,8 @@ static inline bool tpm2_openssl_did_load_public(
  *  A private object loading status
  */
 tpm2_openssl_load_rc tpm2_openssl_load_private(const char *path,
-        const char *pass, TPMI_ALG_PUBLIC alg, TPM2B_PUBLIC *pub,
+        const char *passin, const char *object_auth, TPM2B_PUBLIC *template, TPM2B_PUBLIC *pub,
         TPM2B_SENSITIVE *priv);
-
 
 /**
  * Load an OpenSSL private key and configure all of the flags based on
@@ -258,16 +182,13 @@ tpm2_openssl_load_rc tpm2_openssl_load_private(const char *path,
  */
 bool tpm2_openssl_import_keys(
     TPM2B_PUBLIC *parent_pub,
-    TPM2B_SENSITIVE *private,
-    TPM2B_PUBLIC *public,
     TPM2B_ENCRYPTED_SECRET *encrypted_seed,
+    const char *object_auth_value,
     const char *input_key_file,
-    TPMI_ALG_PUBLIC key_type,
-    const char *auth_key_file,
-    const char *policy_file,
-    const char *key_auth_str,
-    char *attrs_str,
-    const char *name_alg_str
+    const char *passin,
+    TPM2B_PUBLIC *template,
+    TPM2B_SENSITIVE *private,
+    TPM2B_PUBLIC *public
 );
 
 /**
@@ -285,18 +206,6 @@ bool tpm2_openssl_import_keys(
  */
 bool tpm2_openssl_load_public(const char *path, TPMI_ALG_PUBLIC alg,
         TPM2B_PUBLIC *pub);
-
-/**
- * Retrieves a public portion of an ECC key from a PEM file.
- *
- * @param f
- *  The FILE object that is open for reading the path.
- * @param path
- *  The path to load from.
- * @return
- *  The public structure.
- */
-EC_KEY* tpm2_openssl_get_public_ECC_from_pem(FILE *f, const char *path);
 
 /**
  * Maps an ECC curve to an openssl nid value.

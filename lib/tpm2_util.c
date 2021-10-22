@@ -577,13 +577,20 @@ bool tpm2_util_calc_unique(TPMI_ALG_HASH name_alg,
     memcpy(buf.buffer, seed->buffer, seed->size);
     memcpy(&buf.buffer[seed->size], key->buffer, key->size);
 
-    digester d = tpm2_openssl_halg_to_digester(name_alg);
-    if (!d) {
+    const EVP_MD *md = tpm2_openssl_md_from_tpmhalg(name_alg);
+    if (!md) {
+        LOG_ERR("Algorithm not supported: %x", name_alg);
         return false;
     }
 
-    unique_data->size = tpm2_alg_util_get_hash_size(name_alg);
-    d(buf.buffer, buf.size, unique_data->buffer);
+    unsigned int hash_size;
+    int rc = EVP_Digest(buf.buffer, buf.size, unique_data->buffer, &hash_size,
+                        md, NULL);
+    if (!rc) {
+        LOG_ERR("Hash calculation failed");
+        return false;
+    }
+    unique_data->size = hash_size;
 
     return true;
 }
@@ -942,7 +949,7 @@ bool tpm2_calq_qname(TPM2B_NAME *pqname,
     // QNB ≔ HB (QNA || NAMEB)
     bool result = false;
 
-    const EVP_MD *md = tpm2_openssl_halg_from_tpmhalg(halg);
+    const EVP_MD *md = tpm2_openssl_md_from_tpmhalg(halg);
 
     EVP_MD_CTX *mdctx = EVP_MD_CTX_create();
     if (!mdctx) {

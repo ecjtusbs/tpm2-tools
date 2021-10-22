@@ -63,20 +63,20 @@ static unsigned char *hash_ek_public(void) {
         return NULL;
     }
 
-    SHA256_CTX sha256;
-    int is_success = SHA256_Init(&sha256);
+    EVP_MD_CTX *sha256 = EVP_MD_CTX_new();
+    int is_success = EVP_DigestInit(sha256, EVP_sha256());
     if (!is_success) {
-        LOG_ERR("SHA256_Init failed");
+        LOG_ERR("EVP_DigestInit failed");
         goto err;
     }
 
     switch (ctx.out_public->publicArea.type) {
     case TPM2_ALG_RSA:
-        is_success = SHA256_Update(&sha256,
+        is_success = EVP_DigestUpdate(sha256,
                 ctx.out_public->publicArea.unique.rsa.buffer,
                 ctx.out_public->publicArea.unique.rsa.size);
         if (!is_success) {
-            LOG_ERR("SHA256_Update failed");
+            LOG_ERR("EVP_DigestUpdate failed");
             goto err;
         }
 
@@ -85,27 +85,27 @@ static unsigned char *hash_ek_public(void) {
             goto err;
         }
         BYTE buf[3] = { 0x1, 0x00, 0x01 }; // Exponent
-        is_success = SHA256_Update(&sha256, buf, sizeof(buf));
+        is_success = EVP_DigestUpdate(sha256, buf, sizeof(buf));
         if (!is_success) {
-            LOG_ERR("SHA256_Update failed");
+            LOG_ERR("EVP_DigestUpdate failed");
             goto err;
         }
         break;
 
     case TPM2_ALG_ECC:
-        is_success = SHA256_Update(&sha256,
+        is_success = EVP_DigestUpdate(sha256,
                 ctx.out_public->publicArea.unique.ecc.x.buffer,
                 ctx.out_public->publicArea.unique.ecc.x.size);
         if (!is_success) {
-            LOG_ERR("SHA256_Update failed");
+            LOG_ERR("EVP_DigestUpdate failed");
             goto err;
         }
 
-        is_success = SHA256_Update(&sha256,
+        is_success = EVP_DigestUpdate(sha256,
                 ctx.out_public->publicArea.unique.ecc.y.buffer,
                 ctx.out_public->publicArea.unique.ecc.y.size);
         if (!is_success) {
-            LOG_ERR("SHA256_Update failed");
+            LOG_ERR("EVP_DigestUpdate failed");
             goto err;
         }
         break;
@@ -115,12 +115,13 @@ static unsigned char *hash_ek_public(void) {
         goto err;
     }
 
-    is_success = SHA256_Final(hash, &sha256);
+    is_success = EVP_DigestFinal_ex(sha256, hash, NULL);
     if (!is_success) {
-        LOG_ERR("SHA256_Final failed");
+        LOG_ERR("EVP_DigestFinal failed");
         goto err;
     }
 
+    EVP_MD_CTX_free(sha256);
     if (ctx.verbose) {
         tpm2_tool_output("public-key-hash:\n");
         tpm2_tool_output("  sha256: ");
@@ -134,6 +135,7 @@ static unsigned char *hash_ek_public(void) {
     return hash;
 err:
     free(hash);
+    EVP_MD_CTX_free(sha256);
     return NULL;
 }
 
@@ -424,14 +426,17 @@ static tool_rc nv_read(ESYS_CONTEXT *ectx, TPMI_RH_NV_INDEX nv_index) {
         goto nv_read_out;
     }
 
-    TPM2B_DIGEST cp_hash = {
-        .size = 0,
-    };
+    TPM2B_DIGEST cp_hash = { 0 };
+    TPM2B_DIGEST rp_hash = { 0 };
     rc = nv_index == RSA_EK_CERT_NV_INDEX ?
+
          tpm2_util_nv_read(ectx, nv_index, 0, 0, &object, &ctx.rsa_cert_buffer,
-         &ctx.rsa_cert_buffer_size, &cp_hash, TPM2_ALG_SHA256) :
+            &ctx.rsa_cert_buffer_size, &cp_hash, &rp_hash, TPM2_ALG_SHA256, 0,
+            ESYS_TR_NONE, ESYS_TR_NONE) :
+
          tpm2_util_nv_read(ectx, nv_index, 0, 0, &object, &ctx.ecc_cert_buffer,
-         &ctx.ecc_cert_buffer_size, &cp_hash, TPM2_ALG_SHA256);
+            &ctx.ecc_cert_buffer_size, &cp_hash, &rp_hash, TPM2_ALG_SHA256, 0,
+            ESYS_TR_NONE, ESYS_TR_NONE);
 
 nv_read_out:
     tmp_rc = tpm2_session_close(&object.session);
@@ -609,6 +614,13 @@ static tool_rc process_output(void) {
         ctx.is_intc_cert = ctx.is_intc_cert ? ctx.is_intc_cert :
         !(strncmp((const char *)ctx.ecc_cert_buffer,
             "{\"pubhash", strlen("{\"pubhash")));
+    }
+
+    /*
+     * Intel EK certificates on the NV-index are already in standard DER format.
+     */
+    if (ctx.is_intc_cert && ctx.is_cert_on_nv) {
+        ctx.is_cert_raw = true;
     }
 
     /*

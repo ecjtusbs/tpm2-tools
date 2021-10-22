@@ -127,30 +127,40 @@ tool_rc tpm2_getcap(ESYS_CONTEXT *esys_context, TPM2_CAP capability,
 }
 
 tool_rc tpm2_nv_read(ESYS_CONTEXT *esys_context,
-    tpm2_loaded_object *auth_hierarchy_obj, TPM2_HANDLE nv_index, UINT16 size,
-    UINT16 offset, TPM2B_MAX_NV_BUFFER **data, TPM2B_DIGEST *cp_hash,
-    TPMI_ALG_HASH parameter_hash_algorithm) {
+    tpm2_loaded_object *auth_hierarchy_obj, TPM2_HANDLE nv_index,
+    TPM2B_NAME *precalc_nvname, UINT16 size, UINT16 offset,
+    TPM2B_MAX_NV_BUFFER **data, TPM2B_DIGEST *cp_hash,  TPM2B_DIGEST *rp_hash,
+    TPMI_ALG_HASH parameter_hash_algorithm, ESYS_TR shandle2,
+    ESYS_TR shandle3) {
 
-    ESYS_TR esys_tr_nv_handle;
-    TSS2_RC rval = Esys_TR_FromTPMPublic(esys_context, nv_index, ESYS_TR_NONE,
-            ESYS_TR_NONE, ESYS_TR_NONE, &esys_tr_nv_handle);
-    if (rval != TPM2_RC_SUCCESS) {
-        LOG_PERR(Esys_TR_FromTPMPublic, rval);
-        return tool_rc_from_tpm(rval);
+    /*
+     * If command is to be dispatched the NV index must exist.
+     * In this case get the NV index name by reading its public information.
+     * If rpHash size is non zero then command is always dispatched.
+     */
+    ESYS_TR esys_tr_nv_handle = ESYS_TR_NONE;
+    TSS2_RC rval = TSS2_RC_SUCCESS;
+    bool is_name_specified = precalc_nvname ? precalc_nvname->size : false;
+    if (!is_name_specified) {
+        rval = Esys_TR_FromTPMPublic(esys_context, nv_index, ESYS_TR_NONE,
+                ESYS_TR_NONE, ESYS_TR_NONE, &esys_tr_nv_handle);
+        if (rval != TPM2_RC_SUCCESS) {
+            LOG_PERR(Esys_TR_FromTPMPublic, rval);
+            return tool_rc_from_tpm(rval);
+        }
     }
 
+    TSS2_SYS_CONTEXT *sys_context = NULL;
     tool_rc rc = tool_rc_success;
-    if (cp_hash->size) {
-        /*
-         * Need sys_context to be able to calculate CpHash
-         */
-        TSS2_SYS_CONTEXT *sys_context = NULL;
+    if (cp_hash->size || rp_hash->size) {
         rc = tpm2_getsapicontext(esys_context, &sys_context);
         if(rc != tool_rc_success) {
             LOG_ERR("Failed to acquire SAPI context.");
             return rc;
         }
+    }
 
+    if (cp_hash->size) {
         rval = Tss2_Sys_NV_Read_Prepare(sys_context, auth_hierarchy_obj->handle,
             nv_index, size, offset);
         if (rval != TPM2_RC_SUCCESS) {
@@ -158,28 +168,57 @@ tool_rc tpm2_nv_read(ESYS_CONTEXT *esys_context,
             return tool_rc_general_error;
         }
 
-        TPM2B_NAME *name1 = NULL;
-        rc = tpm2_tr_get_name(esys_context, auth_hierarchy_obj->tr_handle, &name1);
-        if (rc != tool_rc_success) {
-            goto tpm2_nvread_free_name1;
+        /*
+         * We need this to use precalc-name for parent authorization when the
+         * NV index itself is the authorization parent AND
+         * we don't need/have the NV index defined when simply calculating cpHash.
+         */
+        bool is_auth_hierarchy_nv_index =
+            (auth_hierarchy_obj->tr_handle != ESYS_TR_RH_OWNER) &&
+            (auth_hierarchy_obj->tr_handle != ESYS_TR_RH_PLATFORM);
+        /*
+         * We need this to avoid requiring an NV-index be defined when simply
+         * calculating cpHash.
+         */
+        TPM2B_NAME *name1 = 0;
+        if (is_auth_hierarchy_nv_index && is_name_specified) {
+            name1 = precalc_nvname;
+        } else {
+            rc = tpm2_tr_get_name(esys_context, auth_hierarchy_obj->tr_handle,
+                &name1);
+            if (rc != tool_rc_success) {
+                goto tpm2_nvread_free_name1;
+            }
         }
 
-        TPM2B_NAME *name2 = NULL;
-        rc = tpm2_tr_get_name(esys_context, esys_tr_nv_handle, &name2);
-        if (rc != tool_rc_success) {
-            goto tpm2_nvread_free_name1_name2;
+        TPM2B_NAME *name2 = 0;
+        if (is_name_specified) {
+            name2 = precalc_nvname;
+        } else {
+            rc = tpm2_tr_get_name(esys_context, esys_tr_nv_handle, &name2);
+            if (rc != tool_rc_success) {
+                goto tpm2_nvread_free_name1_name2;
+            }
         }
 
         rc = tpm2_sapi_getcphash(sys_context, name1, name2, NULL,
             parameter_hash_algorithm, cp_hash);
+
+tpm2_nvread_free_name1_name2:
+        if (!(is_name_specified)) {
+            Esys_Free(name2);
+        }
+tpm2_nvread_free_name1:
+        if (!is_name_specified) {
+            Esys_Free(name1);
+        }
+
         /*
          * Exit here without making the ESYS call since we just need the cpHash
          */
-tpm2_nvread_free_name1_name2:
-        Esys_Free(name2);
-tpm2_nvread_free_name1:
-        Esys_Free(name1);
-        goto tpm2_nvread_skip_esapi_call;
+        if (!rp_hash->size) {
+            goto tpm2_nvread_skip_esapi_call;
+        }
     }
 
     ESYS_TR auth_hierarchy_obj_session_handle = ESYS_TR_NONE;
@@ -192,12 +231,18 @@ tpm2_nvread_free_name1:
     }
 
     rval = Esys_NV_Read(esys_context, auth_hierarchy_obj->tr_handle,
-        esys_tr_nv_handle, auth_hierarchy_obj_session_handle, ESYS_TR_NONE,
-        ESYS_TR_NONE, size, offset, data);
+        esys_tr_nv_handle, auth_hierarchy_obj_session_handle, shandle2,
+        shandle3, size, offset, data);
     if (rval != TSS2_RC_SUCCESS) {
         LOG_PERR(Esys_NV_Read, rval);
         return tool_rc_from_tpm(rval);
     }
+
+    if (rp_hash->size) {
+        rc = tpm2_sapi_getrphash(sys_context, rval, rp_hash,
+            parameter_hash_algorithm);
+    }
+
 tpm2_nvread_skip_esapi_call:
     return rc;
 }
@@ -2945,15 +2990,24 @@ tool_rc tpm2_tr_from_tpm_public(ESYS_CONTEXT *esys_context, TPM2_HANDLE handle, 
 tool_rc tpm2_nvsetbits(ESYS_CONTEXT *esys_context,
     tpm2_loaded_object *auth_hierarchy_obj, TPM2_HANDLE nv_index,
     UINT64 bits, TPM2B_DIGEST *cp_hash, TPM2B_DIGEST *rp_hash,
-    TPMI_ALG_HASH parameter_hash_algorithm, ESYS_TR shandle2,
-    ESYS_TR shandle3) {
+    TPMI_ALG_HASH parameter_hash_algorithm, TPM2B_NAME *precalc_nvname,
+    ESYS_TR shandle2, ESYS_TR shandle3) {
 
-    ESYS_TR esys_tr_nv_handle;
-    TSS2_RC rval = Esys_TR_FromTPMPublic(esys_context, nv_index, ESYS_TR_NONE,
-        ESYS_TR_NONE, ESYS_TR_NONE, &esys_tr_nv_handle);
-    if (rval != TPM2_RC_SUCCESS) {
-        LOG_PERR(Esys_TR_FromTPMPublic, rval);
-        return tool_rc_from_tpm(rval);
+    /*
+     * If command is to be dispatched the NV index must exist.
+     * In this case get the NV index name by reading its public information.
+     * If rpHash size is non zero then command is always dispatched.
+     */
+    ESYS_TR esys_tr_nv_handle = ESYS_TR_NONE;
+    TSS2_RC rval = TSS2_RC_SUCCESS;
+    bool is_name_specified = precalc_nvname ? precalc_nvname->size : false;
+    if (!is_name_specified) {
+        rval = Esys_TR_FromTPMPublic(esys_context, nv_index, ESYS_TR_NONE,
+            ESYS_TR_NONE, ESYS_TR_NONE, &esys_tr_nv_handle);
+        if (rval != TPM2_RC_SUCCESS) {
+            LOG_PERR(Esys_TR_FromTPMPublic, rval);
+            return tool_rc_from_tpm(rval);
+        }
     }
 
     TSS2_SYS_CONTEXT *sys_context = NULL;
@@ -2975,26 +3029,47 @@ tool_rc tpm2_nvsetbits(ESYS_CONTEXT *esys_context,
             return tool_rc_general_error;
         }
 
-        TPM2B_NAME *name1 = NULL;
-        rc = tpm2_tr_get_name(esys_context, auth_hierarchy_obj->tr_handle,
-            &name1);
-        if (rc != tool_rc_success) {
-            goto tpm2_nvsetbits_free_name1;
+        /*
+         * We need this to use precalc-name for parent authorization when the
+         * NV index itself is the authorization parent AND
+         * we don't need/have the NV index defined when simply calculating cpHash.
+         */
+        bool is_auth_hierarchy_nv_index =
+            (auth_hierarchy_obj->tr_handle != ESYS_TR_RH_OWNER) &&
+            (auth_hierarchy_obj->tr_handle != ESYS_TR_RH_PLATFORM);
+
+        TPM2B_NAME *name1 = 0;
+        if (is_auth_hierarchy_nv_index && is_name_specified) {
+            name1 = precalc_nvname;
+        } else {
+            rc = tpm2_tr_get_name(esys_context, auth_hierarchy_obj->tr_handle,
+                &name1);
+            if (rc != tool_rc_success) {
+                goto tpm2_nvsetbits_free_name1;
+            }
         }
 
-        TPM2B_NAME *name2 = NULL;
-        rc = tpm2_tr_get_name(esys_context, esys_tr_nv_handle, &name2);
-        if (rc != tool_rc_success) {
-            goto tpm2_nvsetbits_free_name1_name2;
+        TPM2B_NAME *name2 = 0;
+        if (is_name_specified) {
+            name2 = precalc_nvname;
+        } else {
+            rc = tpm2_tr_get_name(esys_context, esys_tr_nv_handle, &name2);
+            if (rc != tool_rc_success) {
+                goto tpm2_nvsetbits_free_name1_name2;
+            }
         }
 
         rc = tpm2_sapi_getcphash(sys_context, name1, name2, NULL,
             parameter_hash_algorithm, cp_hash);
 
 tpm2_nvsetbits_free_name1_name2:
-        Esys_Free(name2);
+        if (!is_name_specified) {
+            Esys_Free(name2);
+        }
 tpm2_nvsetbits_free_name1:
-        Esys_Free(name1);
+        if (!is_name_specified) {
+            Esys_Free(name1);
+        }
         /*
          * Exit here without making the ESYS call since we just need the cpHash
          */
@@ -3032,15 +3107,24 @@ tpm2_nvsetbits_skip_esapi_call:
 tool_rc tpm2_nvextend(ESYS_CONTEXT *esys_context,
     tpm2_loaded_object *auth_hierarchy_obj, TPM2_HANDLE nv_index,
     TPM2B_MAX_NV_BUFFER *data, TPM2B_DIGEST *cp_hash, TPM2B_DIGEST *rp_hash,
-    TPMI_ALG_HASH parameter_hash_algorithm, ESYS_TR shandle2,
-    ESYS_TR shandle3) {
+    TPMI_ALG_HASH parameter_hash_algorithm, TPM2B_NAME *precalc_nvname,
+    ESYS_TR shandle2, ESYS_TR shandle3) {
 
-    ESYS_TR esys_tr_nv_handle;
-    TSS2_RC rval = Esys_TR_FromTPMPublic(esys_context, nv_index, ESYS_TR_NONE,
+    /*
+     * If command is to be dispatched the NV index must exist.
+     * In this case get the NV index name by reading its public information.
+     * If rpHash size is non zero then command is always dispatched.
+     */
+    ESYS_TR esys_tr_nv_handle = ESYS_TR_NONE;
+    TSS2_RC rval = TSS2_RC_SUCCESS;
+    bool is_name_specified = precalc_nvname ? precalc_nvname->size : false;
+    if (!is_name_specified) {
+        rval = Esys_TR_FromTPMPublic(esys_context, nv_index, ESYS_TR_NONE,
             ESYS_TR_NONE, ESYS_TR_NONE, &esys_tr_nv_handle);
-    if (rval != TPM2_RC_SUCCESS) {
-        LOG_PERR(Esys_TR_FromTPMPublic, rval);
-        return tool_rc_from_tpm(rval);
+        if (rval != TPM2_RC_SUCCESS) {
+            LOG_PERR(Esys_TR_FromTPMPublic, rval);
+            return tool_rc_from_tpm(rval);
+        }
     }
 
     TSS2_SYS_CONTEXT *sys_context = NULL;
@@ -3062,26 +3146,47 @@ tool_rc tpm2_nvextend(ESYS_CONTEXT *esys_context,
             return tool_rc_general_error;
         }
 
-        TPM2B_NAME *name1 = NULL;
-        rc = tpm2_tr_get_name(esys_context, auth_hierarchy_obj->tr_handle,
-            &name1);
-        if (rc != tool_rc_success) {
-            goto tpm2_nvextend_free_name1;
+        /*
+         * We need this to use precalc-name for parent authorization when the
+         * NV index itself is the authorization parent AND
+         * we don't need/have the NV index defined when simply calculating cpHash.
+         */
+        bool is_auth_hierarchy_nv_index =
+            (auth_hierarchy_obj->tr_handle != ESYS_TR_RH_OWNER) &&
+            (auth_hierarchy_obj->tr_handle != ESYS_TR_RH_PLATFORM);
+
+        TPM2B_NAME *name1 = 0;
+        if (is_auth_hierarchy_nv_index && is_name_specified) {
+            name1 = precalc_nvname;
+        } else {
+            rc = tpm2_tr_get_name(esys_context, auth_hierarchy_obj->tr_handle,
+                &name1);
+            if (rc != tool_rc_success) {
+                goto tpm2_nvextend_free_name1;
+            }
         }
 
-        TPM2B_NAME *name2 = NULL;
-        rc = tpm2_tr_get_name(esys_context, esys_tr_nv_handle, &name2);
-        if (rc != tool_rc_success) {
-            goto tpm2_nvextend_free_name1_name2;
+        TPM2B_NAME *name2 = 0;
+        if (is_name_specified) {
+            name2 = precalc_nvname;
+        } else {
+            rc = tpm2_tr_get_name(esys_context, esys_tr_nv_handle, &name2);
+            if (rc != tool_rc_success) {
+                goto tpm2_nvextend_free_name1_name2;
+            }
         }
 
         rc = tpm2_sapi_getcphash(sys_context, name1, name2, NULL,
             parameter_hash_algorithm, cp_hash);
 
 tpm2_nvextend_free_name1_name2:
-        Esys_Free(name2);
+        if (!is_name_specified) {
+            Esys_Free(name2);
+        }
 tpm2_nvextend_free_name1:
-        Esys_Free(name1);
+        if (!is_name_specified) {
+            Esys_Free(name1);
+        }
         /*
          * Exit here without making the ESYS call since we just need the cpHash
          */
@@ -3286,38 +3391,40 @@ tpm2_nvundefinespecial_skip_esapi_call:
 }
 
 tool_rc tpm2_nvwrite(ESYS_CONTEXT *esys_context,
-        tpm2_loaded_object *auth_hierarchy_obj, TPM2_HANDLE nvindex,
-        const TPM2B_MAX_NV_BUFFER *data, UINT16 offset, TPM2B_DIGEST *cp_hash) {
+    tpm2_loaded_object *auth_hierarchy_obj, TPM2_HANDLE nvindex,
+    TPM2B_NAME *precalc_nvname, const TPM2B_MAX_NV_BUFFER *data, UINT16 offset,
+    TPM2B_DIGEST *cp_hash, TPM2B_DIGEST *rp_hash,
+    TPMI_ALG_HASH parameter_hash_algorithm, ESYS_TR shandle2,
+    ESYS_TR shandle3) {
 
-    // Convert TPM2_HANDLE ctx.nv_index to an ESYS_TR
-    ESYS_TR esys_tr_nv_index;
-    TSS2_RC rval = Esys_TR_FromTPMPublic(esys_context, nvindex, ESYS_TR_NONE,
-            ESYS_TR_NONE, ESYS_TR_NONE, &esys_tr_nv_index);
-    if (rval != TPM2_RC_SUCCESS) {
-        LOG_PERR(Esys_TR_FromTPMPublic, rval);
-        return tool_rc_from_tpm(rval);
+    /*
+     * If command is to be dispatched the NV index must exist.
+     * In this case get the NV index name by reading its public information.
+     * If rpHash size is non zero then command is always dispatched.
+     */
+    ESYS_TR esys_tr_nv_handle = ESYS_TR_NONE;
+    TSS2_RC rval = TSS2_RC_SUCCESS;
+    bool is_name_specified = precalc_nvname ? precalc_nvname->size : false;
+    if (!is_name_specified) {
+        rval = Esys_TR_FromTPMPublic(esys_context, nvindex, ESYS_TR_NONE,
+                ESYS_TR_NONE, ESYS_TR_NONE, &esys_tr_nv_handle);
+        if (rval != TPM2_RC_SUCCESS) {
+            LOG_PERR(Esys_TR_FromTPMPublic, rval);
+            return tool_rc_from_tpm(rval);
+        }
     }
 
-    ESYS_TR auth_hierarchy_obj_session_handle = ESYS_TR_NONE;
-    tool_rc rc = tpm2_auth_util_get_shandle(esys_context,
-            auth_hierarchy_obj->tr_handle, auth_hierarchy_obj->session,
-            &auth_hierarchy_obj_session_handle);
-    if (rc != tool_rc_success) {
-        LOG_ERR("Failed to get shandle");
-        return rc;
-    }
-
-    if (cp_hash) {
-        /*
-         * Need sys_context to be able to calculate CpHash
-         */
-        TSS2_SYS_CONTEXT *sys_context = NULL;
+    tool_rc rc = tool_rc_success;
+    TSS2_SYS_CONTEXT *sys_context = NULL;
+    if (cp_hash->size || rp_hash->size) {
         rc = tpm2_getsapicontext(esys_context, &sys_context);
         if(rc != tool_rc_success) {
             LOG_ERR("Failed to acquire SAPI context.");
             return rc;
         }
+    }
 
+    if (cp_hash->size) {
         rval = Tss2_Sys_NV_Write_Prepare(sys_context, auth_hierarchy_obj->handle,
             nvindex, data, offset);
         if (rval != TPM2_RC_SUCCESS) {
@@ -3325,35 +3432,71 @@ tool_rc tpm2_nvwrite(ESYS_CONTEXT *esys_context,
             return tool_rc_general_error;
         }
 
-        TPM2B_NAME *name1 = NULL;
-        rc = tpm2_tr_get_name(esys_context, auth_hierarchy_obj->tr_handle, &name1);
-        if (rc != tool_rc_success) {
-            goto tpm2_nvwrite_free_name1;
+        /*
+         * We need this to use precalc-name for parent authorization when the
+         * NV index itself is the authorization parent AND
+         * we don't need/have the NV index defined when simply calculating cpHash.
+         */
+        bool is_auth_hierarchy_nv_index =
+            (auth_hierarchy_obj->tr_handle != ESYS_TR_RH_OWNER) &&
+            (auth_hierarchy_obj->tr_handle != ESYS_TR_RH_PLATFORM);
+        /*
+         * We need this to avoid requiring an NV-index be defined when simply
+         * calculating cpHash.
+         */
+        TPM2B_NAME *name1 = 0;
+        if (is_auth_hierarchy_nv_index && is_name_specified) {
+            name1 = precalc_nvname;
+        } else {
+            rc = tpm2_tr_get_name(esys_context, auth_hierarchy_obj->tr_handle,
+                &name1);
+            if (rc != tool_rc_success) {
+                goto tpm2_nvwrite_free_name1;
+            }
         }
 
-        TPM2B_NAME *name2 = NULL;
-        rc = tpm2_tr_get_name(esys_context, esys_tr_nv_index, &name2);
-        if (rc != tool_rc_success) {
-            goto tpm2_nvwrite_free_name1_name2;
+        TPM2B_NAME *name2 = 0;
+        if (is_name_specified) {
+            name2 = precalc_nvname;
+        } else {
+            rc = tpm2_tr_get_name(esys_context, esys_tr_nv_handle, &name2);
+            if (rc != tool_rc_success) {
+                goto tpm2_nvwrite_free_name1_name2;
+            }
         }
 
-        cp_hash->size = tpm2_alg_util_get_hash_size(
-            tpm2_session_get_authhash(auth_hierarchy_obj->session));
         rc = tpm2_sapi_getcphash(sys_context, name1, name2, NULL,
-            tpm2_session_get_authhash(auth_hierarchy_obj->session), cp_hash);
+            parameter_hash_algorithm, cp_hash);
         /*
          * Exit here without making the ESYS call since we just need the cpHash
          */
 tpm2_nvwrite_free_name1_name2:
-        Esys_Free(name2);
+        if (!is_name_specified) {
+            Esys_Free(name2);
+        }
+
 tpm2_nvwrite_free_name1:
-        Esys_Free(name1);
-        goto tpm2_nvwrite_skip_esapi_call;
+        if (!is_name_specified) {
+            Esys_Free(name1);
+        }
+
+        if (!rp_hash->size) {
+            goto tpm2_nvwrite_skip_esapi_call;
+        }
+    }
+
+    ESYS_TR auth_hierarchy_obj_session_handle = ESYS_TR_NONE;
+    rc = tpm2_auth_util_get_shandle(esys_context,
+            auth_hierarchy_obj->tr_handle, auth_hierarchy_obj->session,
+            &auth_hierarchy_obj_session_handle);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Failed to get shandle");
+        return rc;
     }
 
     rval = Esys_NV_Write(esys_context, auth_hierarchy_obj->tr_handle,
-            esys_tr_nv_index, auth_hierarchy_obj_session_handle, ESYS_TR_NONE,
-            ESYS_TR_NONE, data, offset);
+            esys_tr_nv_handle, auth_hierarchy_obj_session_handle, shandle2,
+            shandle3, data, offset);
     if (rval != TPM2_RC_SUCCESS) {
         LOG_ERR("Failed to write NV area at index 0x%X", nvindex);
         LOG_PERR(Tss2_Sys_NV_Write, rval);
@@ -3362,6 +3505,11 @@ tpm2_nvwrite_free_name1:
 
     LOG_INFO("Success to write NV area at index 0x%x offset 0x%x.", nvindex,
             offset);
+
+    if (rp_hash->size) {
+        rc = tpm2_sapi_getrphash(sys_context, rval, rp_hash,
+            parameter_hash_algorithm);
+    }
 
 tpm2_nvwrite_skip_esapi_call:
     return rc;

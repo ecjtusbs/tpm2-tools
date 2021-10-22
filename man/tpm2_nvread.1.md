@@ -50,7 +50,24 @@ index can be specified as raw handle or an offset value to the nv handle range
 
     File path to record the hash of the command parameters. This is commonly
     termed as cpHash. NOTE: When this option is selected, The tool will not
-    actually execute the command, it simply returns a cpHash.
+    actually execute the command, it simply returns a cpHash, unless rphash is
+    also required.
+
+  * **\--rphash**=_FILE_
+
+    File path to record the hash of the response parameters. This is commonly
+    termed as rpHash.
+
+  * **-n**, **\--name**=_FILE_:
+
+    The name of the NV index that must be provided when only calculating the
+    cpHash without actually dispatching the command to the TPM.
+
+  * **-S**, **\--session**=_FILE_:
+
+    The session created using **tpm2_startauthsession**. This can be used to
+    specify an auxiliary session for auditing and or encryption/decryption of
+    the parameters.
 
   * **ARGUMENT** the command line argument specifies the NV index or offset
     number.

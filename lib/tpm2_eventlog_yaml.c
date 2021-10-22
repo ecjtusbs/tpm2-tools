@@ -251,7 +251,7 @@ char *yaml_devicepath(BYTE* dp, UINT64 dp_len) {
         return NULL;
     }
   
-    ret = efidp_format_device_path(text_path,
+    ret = efidp_format_device_path((unsigned char *)text_path,
             text_path_len, (const_efidp)dp, dp_len);
     if (ret < 0) {
         free(text_path);
@@ -475,7 +475,7 @@ static bool yaml_uefi_var(UEFI_VARIABLE_DATA *data, size_t size, UINT32 type,
                 tpm2_tool_output("      Description: \"");
                 int i;
                 for (i = 0; (wchar_t)loadopt->Description[i] != 0; i++) {
-                    wchar_t c = (wchar_t)loadopt->Description[i];
+                    char16_t c = (char16_t)loadopt->Description[i];
                     tpm2_tool_output("%lc", c);
                 }
                 tpm2_tool_output("\"\n");

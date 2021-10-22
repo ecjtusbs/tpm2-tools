@@ -6,7 +6,11 @@
 #include <string.h>
 
 #include <openssl/pem.h>
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 #include <openssl/rand.h>
+#else
+#include <openssl/core_names.h>
+#endif
 
 #include "files.h"
 #include "log.h"
@@ -18,29 +22,8 @@
 #include "tpm2_errata.h"
 #include "tpm2_systemdeps.h"
 
-/* compatibility function for OpenSSL versions < 1.1.0 */
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-static int BN_bn2binpad(const BIGNUM *a, unsigned char *to, int tolen) {
-    int r;
-    int topad;
-    int islen;
-
-    islen = BN_num_bytes(a);
-
-    if (tolen < islen)
-        return -1;
-
-    topad = tolen - islen;
-
-    memset(to, 0x00, topad);
-    r = BN_bn2bin(a, to + topad);
-    if (r == 0) {
-        return -1;
-    }
-
-    return tolen;
-}
-#endif
+#define KEYEDHASH_MAX_SIZE 128
+#define HMAC_MAX_SIZE      64
 
 int tpm2_openssl_halgid_from_tpmhalg(TPMI_ALG_HASH algorithm) {
 
@@ -59,7 +42,7 @@ int tpm2_openssl_halgid_from_tpmhalg(TPMI_ALG_HASH algorithm) {
     /* no return, not possible */
 }
 
-const EVP_MD *tpm2_openssl_halg_from_tpmhalg(TPMI_ALG_HASH algorithm) {
+const EVP_MD *tpm2_openssl_md_from_tpmhalg(TPMI_ALG_HASH algorithm) {
 
     switch (algorithm) {
     case TPM2_ALG_SHA1:
@@ -76,76 +59,12 @@ const EVP_MD *tpm2_openssl_halg_from_tpmhalg(TPMI_ALG_HASH algorithm) {
     /* no return, not possible */
 }
 
-#if defined(LIB_TPM2_OPENSSL_OPENSSL_PRE11)
-int RSA_set0_key(RSA *r, BIGNUM *n, BIGNUM *e, BIGNUM *d) {
-
-    if ((r->n == NULL && n == NULL) || (r->e == NULL && e == NULL)) {
-        return 0;
-    }
-
-    if (n != NULL) {
-        BN_free(r->n);
-        r->n = n;
-    }
-
-    if (e != NULL) {
-        BN_free(r->e);
-        r->e = e;
-    }
-
-    if (d != NULL) {
-        BN_free(r->d);
-        r->d = d;
-    }
-
-    return 1;
-}
-
-void RSA_get0_factors(const RSA *r, const BIGNUM **p, const BIGNUM **q) {
-    if(p) {
-        *p = r->p;
-    }
-
-    if (q) {
-        *q = r->q;
-    }
-}
-
-int ECDSA_SIG_set0(ECDSA_SIG *sig, BIGNUM *r, BIGNUM *s) {
-
-    if (!r || !s) {
-        return 0;
-    }
-
-    BN_clear_free(sig->r);
-    BN_clear_free(sig->s);
-
-    sig->r = r;
-    sig->s = s;
-
-    return 1;
-}
-
-EVP_ENCODE_CTX *EVP_ENCODE_CTX_new(void) {
-	EVP_ENCODE_CTX *ctx = OPENSSL_malloc(sizeof(EVP_ENCODE_CTX));
-	if (ctx) {
-		memset(ctx, 0, sizeof(*ctx));
-	}
-	return ctx;
-}
-
-void EVP_ENCODE_CTX_free(EVP_ENCODE_CTX *ctx) {
-    OPENSSL_free(ctx);
-}
-
-#endif
-
 bool tpm2_openssl_hash_compute_data(TPMI_ALG_HASH halg, BYTE *buffer,
         UINT16 length, TPM2B_DIGEST *digest) {
 
     bool result = false;
 
-    const EVP_MD *md = tpm2_openssl_halg_from_tpmhalg(halg);
+    const EVP_MD *md = tpm2_openssl_md_from_tpmhalg(halg);
     if (!md) {
         return false;
     }
@@ -189,7 +108,7 @@ bool tpm2_openssl_pcr_extend(TPMI_ALG_HASH halg, BYTE *pcr,
 
     bool result = false;
 
-    const EVP_MD *md = tpm2_openssl_halg_from_tpmhalg(halg);
+    const EVP_MD *md = tpm2_openssl_md_from_tpmhalg(halg);
     if (!md) {
         return false;
     }
@@ -238,7 +157,7 @@ bool tpm2_openssl_hash_pcr_values(TPMI_ALG_HASH halg, TPML_DIGEST *digests,
 
     bool result = false;
 
-    const EVP_MD *md = tpm2_openssl_halg_from_tpmhalg(halg);
+    const EVP_MD *md = tpm2_openssl_md_from_tpmhalg(halg);
     if (!md) {
         return false;
     }
@@ -290,7 +209,7 @@ bool tpm2_openssl_hash_pcr_banks(TPMI_ALG_HASH hash_alg,
     UINT32 vi = 0, di = 0, i;
     bool result = false;
 
-    const EVP_MD *md = tpm2_openssl_halg_from_tpmhalg(hash_alg);
+    const EVP_MD *md = tpm2_openssl_md_from_tpmhalg(hash_alg);
     if (!md) {
         return false;
     }
@@ -367,7 +286,7 @@ bool tpm2_openssl_hash_pcr_banks_le(TPMI_ALG_HASH hash_alg,
     UINT32 vi = 0, di = 0, i;
     bool result = false;
 
-    const EVP_MD *md = tpm2_openssl_halg_from_tpmhalg(hash_alg);
+    const EVP_MD *md = tpm2_openssl_md_from_tpmhalg(hash_alg);
     if (!md) {
         return false;
     }
@@ -434,75 +353,6 @@ bool tpm2_openssl_hash_pcr_banks_le(TPMI_ALG_HASH hash_alg,
 out:
     EVP_MD_CTX_destroy(mdctx);
     return result;
-}
-
-HMAC_CTX *tpm2_openssl_hmac_new() {
-    HMAC_CTX *ctx;
-#if defined(LIB_TPM2_OPENSSL_OPENSSL_PRE11)
-    ctx = malloc(sizeof(*ctx));
-#else
-    ctx = HMAC_CTX_new();
-#endif
-    if (!ctx)
-        return NULL;
-
-#if defined(LIB_TPM2_OPENSSL_OPENSSL_PRE11)
-    HMAC_CTX_init(ctx);
-#endif
-
-    return ctx;
-}
-
-void tpm2_openssl_hmac_free(HMAC_CTX *ctx) {
-#if defined(LIB_TPM2_OPENSSL_OPENSSL_PRE11)
-    HMAC_CTX_cleanup(ctx);
-    free(ctx);
-#else
-    HMAC_CTX_free(ctx);
-#endif
-}
-
-EVP_CIPHER_CTX *tpm2_openssl_cipher_new(void) {
-    EVP_CIPHER_CTX *ctx;
-#if defined(LIB_TPM2_OPENSSL_OPENSSL_PRE11)
-    ctx = malloc(sizeof(*ctx));
-#else
-    ctx = EVP_CIPHER_CTX_new();
-#endif
-    if (!ctx)
-        return NULL;
-
-#if defined(LIB_TPM2_OPENSSL_OPENSSL_PRE11)
-    EVP_CIPHER_CTX_init(ctx);
-#endif
-
-    return ctx;
-}
-
-void tpm2_openssl_cipher_free(EVP_CIPHER_CTX *ctx) {
-#if defined(LIB_TPM2_OPENSSL_OPENSSL_PRE11)
-    EVP_CIPHER_CTX_cleanup(ctx);
-    free(ctx);
-#else
-    EVP_CIPHER_CTX_free(ctx);
-#endif
-}
-
-digester tpm2_openssl_halg_to_digester(TPMI_ALG_HASH halg) {
-
-    switch (halg) {
-    case TPM2_ALG_SHA1:
-        return SHA1;
-    case TPM2_ALG_SHA256:
-        return SHA256;
-    case TPM2_ALG_SHA384:
-        return SHA384;
-    case TPM2_ALG_SHA512:
-        return SHA512;
-        /* no default */
-    }
-
-    return NULL;
 }
 
 /*
@@ -677,8 +527,9 @@ static bool handle_ossl_pass(const char *passin, char **pass) {
     return pfn(passin, pass);
 }
 
-static bool load_public_RSA_from_key(RSA *k, TPM2B_PUBLIC *pub) {
+static bool load_public_RSA_from_key(EVP_PKEY *key, TPM2B_PUBLIC *pub) {
 
+    bool result = false;
     TPMT_PUBLIC *pt = &pub->publicArea;
     pt->type = TPM2_ALG_RSA;
 
@@ -693,16 +544,33 @@ static bool load_public_RSA_from_key(RSA *k, TPM2B_PUBLIC *pub) {
     sym->keyBits.sym = 0;
     sym->mode.sym = TPM2_ALG_NULL;
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
     const BIGNUM *n; /* modulus */
     const BIGNUM *e; /* public key exponent */
 
-#if defined(LIB_TPM2_OPENSSL_OPENSSL_PRE11)
-    n = k->n;
-    e = k->e;
-#else
-    RSA_get0_key(k, &n, &e, NULL);
-#endif
+    RSA *k = EVP_PKEY_get0_RSA(key);
+    if (!k) {
+        LOG_ERR("Could not retrieve RSA key");
+        goto out;
+    }
 
+    RSA_get0_key(k, &n, &e, NULL);
+#else
+    BIGNUM *n = NULL; /* modulus */
+    BIGNUM *e = NULL; /* public key exponent */
+
+    int rc = EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_N, &n);
+    if (!rc) {
+        LOG_ERR("Could not read public modulus N");
+        goto out;
+    }
+
+    rc = EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_E, &e);
+    if (!rc) {
+        LOG_ERR("Could not read public exponent E");
+        goto out;
+    }
+#endif
     /*
      * The size of the modulus is the key size in RSA, store this as the
      * keyBits in the RSA details.
@@ -715,7 +583,7 @@ static bool load_public_RSA_from_key(RSA *k, TPM2B_PUBLIC *pub) {
         break;
     default:
         LOG_ERR("RSA key-size %u is not supported", rdetail->keyBits);
-        return false;
+        goto out;
     }
 
     /* copy the modulus to the unique RSA field */
@@ -723,47 +591,25 @@ static bool load_public_RSA_from_key(RSA *k, TPM2B_PUBLIC *pub) {
     int success = BN_bn2bin(n, pt->unique.rsa.buffer);
     if (!success) {
         LOG_ERR("Could not copy public modulus N");
-        return false;
+        goto out;
     }
 
-    /*Make sure that we can fit the exponent into a UINT32 */
-    unsigned e_size = BN_num_bytes(e);
-    if (e_size > sizeof(rdetail->exponent)) {
-        LOG_ERR(
-                "Exponent is too big. Got %d expected less than or equal to %zu",
-                e_size, sizeof(rdetail->exponent));
-        return false;
+    unsigned long exp = BN_get_word(e);
+    if (exp == 0xffffffffL) {
+        LOG_ERR("Could not copy public exponent E");
+        goto out;
     }
+    rdetail->exponent = exp;
 
-    /*
-     * Copy the exponent into the field.
-     * Returns 1 on success false on error.
-     */
-    return BN_bn2bin(e, (unsigned char *) &rdetail->exponent);
-}
-
-static RSA *tpm2_openssl_get_public_RSA_from_pem(FILE *f, const char *path) {
-
-    /*
-     * Public PEM files appear in two formats:
-     * 1. PEM format, read with PEM_read_RSA_PUBKEY
-     * 2. PKCS#1 format, read with PEM_read_RSAPublicKey
-     *
-     * See:
-     *  - https://stackoverflow.com/questions/7818117/why-i-cant-read-openssl-generated-rsa-pub-key-with-pem-read-rsapublickey
-     */
-    RSA *pub = PEM_read_RSA_PUBKEY(f, NULL, NULL, NULL);
-    if (!pub) {
-        pub = PEM_read_RSAPublicKey(f, NULL, NULL, NULL);
-    }
-
-    if (!pub) {
-        ERR_print_errors_fp(stderr);
-        LOG_ERR("Reading public PEM file \"%s\" failed", path);
-        return NULL;
-    }
-
-    return pub;
+    result = true;
+out:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    /* k,n,e point to internal structrues and must not be freed after use */
+#else
+    BN_free(n);
+    BN_free(e);
+#endif
+    return result;
 }
 
 static bool load_public_RSA_from_pem(FILE *f, const char *path,
@@ -777,15 +623,19 @@ static bool load_public_RSA_from_pem(FILE *f, const char *path,
      * See:
      *  - https://stackoverflow.com/questions/7818117/why-i-cant-read-openssl-generated-rsa-pub-key-with-pem-read-rsapublickey
      */
-    RSA *k = tpm2_openssl_get_public_RSA_from_pem(f, path);
+    EVP_PKEY *k = PEM_read_PUBKEY(f, NULL, NULL, NULL);
     if (!k) {
-        /* tpm2_openssl_get_public_RSA_from_pem() should already log errors */
+        ERR_print_errors_fp(stderr);
+        LOG_ERR("Reading public PEM file \"%s\" failed", path);
         return false;
     }
 
-    bool result = load_public_RSA_from_key(k, pub);
+    bool result = false;
+    if (EVP_PKEY_base_id(k) == EVP_PKEY_RSA) {
+        result = load_public_RSA_from_key(k, pub);
+    }
 
-    RSA_free(k);
+    EVP_PKEY_free(k);
 
     return result;
 }
@@ -848,39 +698,41 @@ int tpm2_ossl_curve_to_nid(TPMI_ECC_CURVE curve) {
     return -1;
 }
 
-static bool load_public_ECC_from_key(EC_KEY *k, TPM2B_PUBLIC *pub) {
+static bool load_public_ECC_from_key(EVP_PKEY *key, TPM2B_PUBLIC *pub) {
 
+    BIGNUM *y = NULL;
+    BIGNUM *x = NULL;
+    int nid;
+    unsigned keysize;
     bool result = false;
-
-    BIGNUM *y = BN_new();
-    BIGNUM *x = BN_new();
-    if (!x || !y) {
-        LOG_ERR("oom");
-        goto out;
-    }
 
     /*
      * Set the algorithm type
      */
     pub->publicArea.type = TPM2_ALG_ECC;
+    TPMS_ECC_PARMS *pp = &pub->publicArea.parameters.eccDetail;
 
     /*
-     * Get the curve type
+     * Get the curve type and the public key (X and Y)
      */
-    const EC_GROUP *group = EC_KEY_get0_group(k);
-    int nid = EC_GROUP_get_curve_name(group);
-
-    TPMS_ECC_PARMS *pp = &pub->publicArea.parameters.eccDetail;
-    TPM2_ECC_CURVE curve_id = ossl_nid_to_curve(nid); // Not sure what lines up with NIST 256...
-    if (curve_id == TPM2_ALG_ERROR) {
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY *k = EVP_PKEY_get0_EC_KEY(key);
+    if (!k) {
+        LOG_ERR("Could not retrieve ECC key");
         goto out;
     }
 
-    pp->curveID = curve_id;
+    y = BN_new();
+    x = BN_new();
+    if (!x || !y) {
+        LOG_ERR("oom");
+        goto out;
+    }
 
-    /*
-     * Set the unique data to the public key.
-     */
+    const EC_GROUP *group = EC_KEY_get0_group(k);
+    nid = EC_GROUP_get_curve_name(group);
+    keysize = (EC_GROUP_get_degree(group) + 7) / 8;
+
     const EC_POINT *point = EC_KEY_get0_public_key(k);
 
     int ret = EC_POINT_get_affine_coordinates_tss(group, point, x, y, NULL);
@@ -888,6 +740,39 @@ static bool load_public_ECC_from_key(EC_KEY *k, TPM2B_PUBLIC *pub) {
         LOG_ERR("Could not get X and Y affine coordinates");
         goto out;
     }
+#else
+    char curve_name[80];
+
+    int rc = EVP_PKEY_get_utf8_string_param(key, OSSL_PKEY_PARAM_GROUP_NAME,
+                                            curve_name, sizeof(curve_name), NULL);
+    if (!rc) {
+        LOG_ERR("Could not read ECC curve name");
+        goto out;
+    }
+    nid = OBJ_txt2nid(curve_name);
+    keysize = (EVP_PKEY_bits(key) + 7) / 8;
+
+    rc = EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_EC_PUB_X, &x);
+    if (!rc) {
+        LOG_ERR("Could not read public X coordinate");
+        goto out;
+    }
+
+    rc = EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_EC_PUB_Y, &y);
+    if (!rc) {
+        LOG_ERR("Could not read public Y coordinate");
+        goto out;
+    }
+#endif
+
+    /*
+     * Set the curve type
+     */
+    TPM2_ECC_CURVE curve_id = ossl_nid_to_curve(nid); // Not sure what lines up with NIST 256...
+    if (curve_id == TPM2_ALG_ERROR) {
+        goto out;
+    }
+    pp->curveID = curve_id;
 
     /*
      * Copy the X and Y coordinate data into the ECC unique field,
@@ -896,28 +781,26 @@ static bool load_public_ECC_from_key(EC_KEY *k, TPM2B_PUBLIC *pub) {
     TPM2B_ECC_PARAMETER *X = &pub->publicArea.unique.ecc.x;
     TPM2B_ECC_PARAMETER *Y = &pub->publicArea.unique.ecc.y;
 
-    unsigned x_size = (EC_GROUP_get_degree(group) + 7) / 8;
-    if (x_size > sizeof(X->buffer)) {
+    if (keysize > sizeof(X->buffer)) {
         LOG_ERR("X coordinate is too big. Got %u expected less than or equal to"
-                " %zu", x_size, sizeof(X->buffer));
+                " %zu", keysize, sizeof(X->buffer));
         goto out;
     }
 
-    unsigned y_size = (EC_GROUP_get_degree(group) + 7) / 8;
-    if (y_size > sizeof(Y->buffer)) {
+    if (keysize > sizeof(Y->buffer)) {
         LOG_ERR("X coordinate is too big. Got %u expected less than or equal to"
-                " %zu", y_size, sizeof(Y->buffer));
+                " %zu", keysize, sizeof(Y->buffer));
         goto out;
     }
 
-    X->size = BN_bn2binpad(x, X->buffer, x_size);
-    if (X->size != x_size) {
+    X->size = BN_bn2binpad(x, X->buffer, keysize);
+    if (X->size != keysize) {
         LOG_ERR("Error converting X point BN to binary");
         goto out;
     }
 
-    Y->size = BN_bn2binpad(y, Y->buffer, y_size);
-    if (Y->size != y_size) {
+    Y->size = BN_bn2binpad(y, Y->buffer, keysize);
+    if (Y->size != keysize) {
         LOG_ERR("Error converting Y point BN to binary");
         goto out;
     }
@@ -937,43 +820,28 @@ static bool load_public_ECC_from_key(EC_KEY *k, TPM2B_PUBLIC *pub) {
     sym->mode.sym = TPM2_ALG_NULL;
 
     result = true;
-
 out:
-    if (x) {
-        BN_free(x);
-    }
-    if (y) {
-        BN_free(y);
-    }
-
+    BN_free(x);
+    BN_free(y);
     return result;
-}
-
-EC_KEY *tpm2_openssl_get_public_ECC_from_pem(FILE *f, const char *path) {
-
-    EC_KEY *pub = PEM_read_EC_PUBKEY(f, NULL, NULL, NULL);
-    if (!pub) {
-        ERR_print_errors_fp(stderr);
-        LOG_ERR("Reading public PEM file \"%s\" failed", path);
-        return NULL;
-    }
-
-    return pub;
 }
 
 static bool load_public_ECC_from_pem(FILE *f, const char *path,
         TPM2B_PUBLIC *pub) {
 
-    EC_KEY *k = tpm2_openssl_get_public_ECC_from_pem(f, path);
+    EVP_PKEY *k = PEM_read_PUBKEY(f, NULL, NULL, NULL);
     if (!k) {
         ERR_print_errors_fp(stderr);
         LOG_ERR("Reading PEM file \"%s\" failed", path);
         return false;
     }
 
-    bool result = load_public_ECC_from_key(k, pub);
+    bool result = false;
+    if (EVP_PKEY_base_id(k) == EVP_PKEY_EC) {
+        result = load_public_ECC_from_key(k, pub);
+    }
 
-    EC_KEY_free(k);
+    EVP_PKEY_free(k);
 
     return result;
 }
@@ -1018,14 +886,26 @@ static bool load_public_AES_from_file(FILE *f, const char *path,
     return tpm2_util_calc_unique(name_alg, key, seed, unique);
 }
 
-static bool load_private_RSA_from_key(RSA *k, TPM2B_SENSITIVE *priv) {
+static bool load_private_RSA_from_key(EVP_PKEY *key, TPM2B_SENSITIVE *priv) {
 
-    const BIGNUM *p; /* the private key exponent */
+    bool result = false;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    const BIGNUM *p = NULL; /* the private key exponent */
 
-#if defined(LIB_TPM2_OPENSSL_OPENSSL_PRE11)
-    p = k->p;
-#else
+    RSA *k = EVP_PKEY_get0_RSA(key);
+    if (!k) {
+        LOG_ERR("Could not retrieve RSA key");
+        goto out;
+    }
     RSA_get0_factors(k, &p, NULL);
+#else
+    BIGNUM *p = NULL; /* the private key exponent */
+
+    int rc = EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_FACTOR1, &p);
+    if (!rc) {
+        LOG_ERR("Could not read private key");
+        goto out;
+    }
 #endif
 
     TPMT_SENSITIVE *sa = &priv->sensitiveArea;
@@ -1038,7 +918,7 @@ static bool load_private_RSA_from_key(RSA *k, TPM2B_SENSITIVE *priv) {
     if (priv_bytes > sizeof(pkr->buffer)) {
         LOG_ERR("Expected prime \"d\" to be less than or equal to %zu,"
                 " got: %u", sizeof(pkr->buffer), priv_bytes);
-        return false;
+        goto out;
     }
 
     pkr->size = priv_bytes;
@@ -1047,10 +927,16 @@ static bool load_private_RSA_from_key(RSA *k, TPM2B_SENSITIVE *priv) {
     if (!success) {
         ERR_print_errors_fp(stderr);
         LOG_ERR("Could not copy private exponent \"d\"");
-        return false;
+        goto out;
     }
-
-    return true;
+    result = true;
+out:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    /* k,p point to internal structrues and must not be freed after use */
+#else
+    BN_free(p);
+#endif
+    return result;
 }
 
 bool tpm2_openssl_load_public(const char *path, TPMI_ALG_PUBLIC alg,
@@ -1073,8 +959,7 @@ bool tpm2_openssl_load_public(const char *path, TPMI_ALG_PUBLIC alg,
         break;
         /* Skip AES here, as we can only load this one from a private file */
     default:
-        /* default try TSS */
-        result = files_load_public(path, pub);
+        LOG_ERR("Unkown public format: 0x%x", alg);
     }
 
     fclose(f);
@@ -1082,8 +967,9 @@ bool tpm2_openssl_load_public(const char *path, TPMI_ALG_PUBLIC alg,
     return result;
 }
 
-static bool load_private_ECC_from_key(EC_KEY *k, TPM2B_SENSITIVE *priv) {
+static bool load_private_ECC_from_key(EVP_PKEY *key, TPM2B_SENSITIVE *priv) {
 
+    bool result = false;
     /*
      * private data
      */
@@ -1091,22 +977,45 @@ static bool load_private_ECC_from_key(EC_KEY *k, TPM2B_SENSITIVE *priv) {
 
     TPM2B_ECC_PARAMETER *p = &priv->sensitiveArea.sensitive.ecc;
 
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    EC_KEY *k = EVP_PKEY_get0_EC_KEY(key);
+    if (!k) {
+        LOG_ERR("Could not retrieve ECC key");
+        goto out;
+    }
+
     const EC_GROUP *group = EC_KEY_get0_group(k);
     const BIGNUM *b = EC_KEY_get0_private_key(k);
-
     unsigned priv_bytes = (EC_GROUP_get_degree(group) + 7) / 8;
+#else
+    BIGNUM *b = NULL; /* the private key exponent */
+
+    int rc = EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_PRIV_KEY, &b);
+    if (!rc) {
+        LOG_ERR("Could not read ECC private key");
+        goto out;
+    }
+    unsigned priv_bytes = (EVP_PKEY_bits(key) + 7) / 8;
+#endif
+
     if (priv_bytes > sizeof(p->buffer)) {
         LOG_ERR("Expected ECC private portion to be less than or equal to %zu,"
                 " got: %u", sizeof(p->buffer), priv_bytes);
-        return false;
+        goto out;
     }
 
     p->size = BN_bn2binpad(b, p->buffer, priv_bytes);
     if (p->size != priv_bytes) {
-        return false;
+        goto out;
     }
-
-    return true;
+    result = true;
+out:
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
+    /* k,b point to internal structrues and must not be freed after use */
+#else
+    BN_free(b);
+#endif
+    return result;
 }
 
 static tpm2_openssl_load_rc load_private_ECC_from_pem(FILE *f, const char *path,
@@ -1120,8 +1029,7 @@ static tpm2_openssl_load_rc load_private_ECC_from_pem(FILE *f, const char *path,
         return lprc_error;
     }
 
-    EC_KEY *k = PEM_read_ECPrivateKey(f, NULL,
-    NULL, (void *) pass);
+    EVP_PKEY *k = PEM_read_PrivateKey(f, NULL, NULL, (void *) pass);
     free(pass);
     if (!k) {
         ERR_print_errors_fp(stderr);
@@ -1146,14 +1054,14 @@ static tpm2_openssl_load_rc load_private_ECC_from_pem(FILE *f, const char *path,
     rc |= lprc_public;
 
 out:
-    EC_KEY_free(k);
+    EVP_PKEY_free(k);
     return rc;
 }
 
 static tpm2_openssl_load_rc load_private_RSA_from_pem(FILE *f, const char *path,
         const char *passin, TPM2B_PUBLIC *pub, TPM2B_SENSITIVE *priv) {
 
-    RSA *k = NULL;
+    EVP_PKEY *k = NULL;
 
     tpm2_openssl_load_rc rc = lprc_error;
 
@@ -1163,8 +1071,7 @@ static tpm2_openssl_load_rc load_private_RSA_from_pem(FILE *f, const char *path,
         return lprc_error;
     }
 
-    k = PEM_read_RSAPrivateKey(f, NULL,
-    NULL, (void *) pass);
+    k = PEM_read_PrivateKey(f, NULL, NULL, (void *) pass);
     free(pass);
     if (!k) {
         ERR_print_errors_fp(stderr);
@@ -1186,7 +1093,7 @@ static tpm2_openssl_load_rc load_private_RSA_from_pem(FILE *f, const char *path,
         rc |= lprc_public;
     }
 out:
-    RSA_free(k);
+    EVP_PKEY_free(k);
     return rc;
 }
 
@@ -1222,25 +1129,56 @@ static tpm2_openssl_load_rc load_private_AES_from_file(FILE *f,
     return lprc_private | lprc_public;
 }
 
-/**
- * Loads a private portion of a key, and possibly the public portion, as for RSA the public data is in
- * a private pem file.
- *
- * @param path
- *  The path to load from.
- * @param alg
- *  algorithm type to import.
- * @param pub
- *  The public structure to populate. Note that nameAlg must be populated.
- * @param priv
- *  The sensitive structure to populate.
- *
- * @returns
- *  A private object loading status
- */
+static tpm2_openssl_load_rc load_private_KEYEDHASH_from_file(FILE *f,
+        const char *path, TPM2B_PUBLIC *pub, TPM2B_SENSITIVE *priv) {
+
+    unsigned long file_size = 0;
+    bool result = files_get_file_size(f, &file_size, path);
+    if (!result) {
+        return lprc_error;
+    }
+
+    priv->sensitiveArea.sensitiveType = TPM2_ALG_KEYEDHASH;
+
+    size_t max_size = pub->publicArea.parameters.keyedHashDetail.scheme.scheme == TPM2_ALG_NULL ?
+            KEYEDHASH_MAX_SIZE : HMAC_MAX_SIZE;
+    if (file_size > max_size || file_size == 0) {
+      LOG_ERR("Invalid %s key size, got %lu bytes, expected 1 to 128 bytes",
+                tpm2_alg_util_algtostr(
+                    pub->publicArea.parameters.keyedHashDetail.scheme.scheme,
+                    tpm2_alg_util_flags_any), file_size);
+      return lprc_error;
+    }
+
+    TPM2B_SENSITIVE_DATA *b = &priv->sensitiveArea.sensitive.bits;
+    b->size = file_size;
+
+    result = files_read_bytes(f, b->buffer, b->size);
+    if (!result) {
+        return lprc_error;
+    }
+
+    /*
+     * calculate the unique and we're done, this is the only thing left for public
+     * so no need for another function.
+     */
+    TPM2B_DIGEST *unique = &pub->publicArea.unique.keyedHash;
+    TPM2B_DIGEST *seed = &priv->sensitiveArea.seedValue;
+    TPM2B_PRIVATE_VENDOR_SPECIFIC *key = &priv->sensitiveArea.sensitive.any;
+    TPMI_ALG_HASH name_alg = pub->publicArea.nameAlg;
+
+    result = tpm2_util_calc_unique(name_alg, key, seed, unique);
+    if (!result) {
+        return lprc_error;
+    }
+
+    return lprc_private | lprc_public;
+}
+
 tpm2_openssl_load_rc tpm2_openssl_load_private(const char *path,
-        const char *pass, TPMI_ALG_PUBLIC alg, TPM2B_PUBLIC *pub,
+        const char *passin, const char *object_auth, TPM2B_PUBLIC *template, TPM2B_PUBLIC *pub,
         TPM2B_SENSITIVE *priv) {
+
 
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -1248,110 +1186,77 @@ tpm2_openssl_load_rc tpm2_openssl_load_private(const char *path,
         return 0;
     }
 
+    *pub = *template;
+
     tpm2_openssl_load_rc rc = lprc_error;
 
-    switch (alg) {
+    switch (template->publicArea.type) {
     case TPM2_ALG_RSA:
-        rc = load_private_RSA_from_pem(f, path, pass, pub, priv);
+        rc = load_private_RSA_from_pem(f, path, passin, pub, priv);
         break;
-    case TPM2_ALG_AES:
-        if (pass) {
+    case TPM2_ALG_SYMCIPHER:
+        if (passin) {
             LOG_ERR("No password can be used for protecting AES key");
+            rc = lprc_error;
+        } else if (template->publicArea.parameters.asymDetail.symmetric.algorithm != TPM2_ALG_AES) {
+            LOG_ERR("Cannot handle non-aes symmetric objects, got: 0x%x",
+                    template->publicArea.parameters.asymDetail.symmetric.algorithm);
             rc = lprc_error;
         } else {
             rc = load_private_AES_from_file(f, path, pub, priv);
         }
         break;
+    case TPM2_ALG_HMAC:
+        /* falls-thru */
+    case TPM2_ALG_KEYEDHASH:
+        if (passin) {
+            LOG_ERR("No password can be used for protecting %s key",
+                    TPM2_ALG_HMAC ? "HMAC" : "Keyed Hash");
+            rc = lprc_error;
+        } else {
+            rc = load_private_KEYEDHASH_from_file(f, path, pub, priv);
+	}
+      break;
     case TPM2_ALG_ECC:
-        rc = load_private_ECC_from_pem(f, path, pass, pub, priv);
+        rc = load_private_ECC_from_pem(f, path, passin, pub, priv);
         break;
     default:
-        LOG_ERR("Cannot handle algorithm, got: %s", tpm2_alg_util_algtostr(alg,
+        LOG_ERR("Cannot handle algorithm, got: %s", tpm2_alg_util_algtostr(template->publicArea.type,
             tpm2_alg_util_flags_any));
         rc = lprc_error;
     }
 
     fclose(f);
 
-    return rc;
-}
-
-bool tpm2_openssl_import_keys(
-    TPM2B_PUBLIC *parent_pub,
-    TPM2B_SENSITIVE *private,
-    TPM2B_PUBLIC *public,
-    TPM2B_ENCRYPTED_SECRET *encrypted_seed,
-    const char *input_key_file,
-    TPMI_ALG_PUBLIC key_type,
-    const char *auth_key_file,
-    const char *policy_file,
-    const char *key_auth_str,
-    char *attrs_str,
-    const char *name_alg_str
-)
-{
-    bool result;
-
-    TPMA_OBJECT attrs = TPMA_OBJECT_DECRYPT | TPMA_OBJECT_SIGN_ENCRYPT;
-
-    if (policy_file) {
-        public->publicArea.authPolicy.size = sizeof(public->publicArea.authPolicy.buffer);
-        result = files_load_bytes_from_path(policy_file,
-            public->publicArea.authPolicy.buffer,
-                &public->publicArea.authPolicy.size);
-        if (!result) {
-            return false;
-        }
-    } else {
-        attrs |= TPMA_OBJECT_USERWITHAUTH;
-    }
-
-    if (key_auth_str) {
+    if (object_auth) {
         tpm2_session *tmp;
-        tool_rc tmp_rc = tpm2_auth_util_from_optarg(NULL, key_auth_str, &tmp, true);
+        tool_rc tmp_rc = tpm2_auth_util_from_optarg(NULL, object_auth, &tmp, true);
         if (tmp_rc != tool_rc_success) {
             LOG_ERR("Invalid key authorization");
             return false;
         }
 
         const TPM2B_AUTH *auth = tpm2_session_get_auth_value(tmp);
-        private->sensitiveArea.authValue = *auth;
+        priv->sensitiveArea.authValue = *auth;
 
         tpm2_session_close(&tmp);
     }
 
-    /*
-     * Set the object attributes if specified, overwriting the defaults, but hooking the errata
-     * fixups.
-     */
-    if (attrs_str) {
-        TPMA_OBJECT *obj_attrs = &public->publicArea.objectAttributes;
-        result = tpm2_attr_util_obj_from_optarg(attrs_str, obj_attrs);
-        if (!result) {
-            LOG_ERR("Invalid object attribute, got\"%s\"", attrs_str);
-            return false;
-        }
+    return rc;
+}
 
-        tpm2_errata_fixup(SPEC_116_ERRATA_2_7,
-                &public->publicArea.objectAttributes);
-    } else {
-        public->publicArea.objectAttributes = attrs;
-    }
+bool tpm2_openssl_import_keys(
+        TPM2B_PUBLIC *parent_pub,
+        TPM2B_ENCRYPTED_SECRET *encrypted_seed,
+        const char *object_auth_value,
+        const char *input_key_file,
+        const char *passin,
+        TPM2B_PUBLIC *template,
+        TPM2B_SENSITIVE *out_private,
+        TPM2B_PUBLIC *out_public
+    ) {
 
-    if (name_alg_str) {
-        TPMI_ALG_HASH alg = tpm2_alg_util_from_optarg(name_alg_str,
-                tpm2_alg_util_flags_hash);
-        if (alg == TPM2_ALG_ERROR) {
-            LOG_ERR("Invalid name hashing algorithm, got\"%s\"", name_alg_str);
-            return tool_rc_general_error;
-        }
-        public->publicArea.nameAlg = alg;
-    } else {
-        /*
-         * use the parent name algorithm if not specified
-         */
-        public->publicArea.nameAlg = parent_pub->publicArea.nameAlg;
-    }
+    bool result;
 
     /*
      * The TPM Requires that the name algorithm for the child be less than the name
@@ -1363,7 +1268,7 @@ bool tpm2_openssl_import_keys(
      *   - Line: 2019
      *   - Decription: Limits the size of the hash algorithm to less then the parent's name-alg when scheme is NULL.
      */
-    UINT16 hash_size = tpm2_alg_util_get_hash_size(public->publicArea.nameAlg);
+    UINT16 hash_size = tpm2_alg_util_get_hash_size(template->publicArea.nameAlg);
     UINT16 parent_hash_size = tpm2_alg_util_get_hash_size(
             parent_pub->publicArea.nameAlg);
     if (hash_size > parent_hash_size) {
@@ -1371,7 +1276,7 @@ bool tpm2_openssl_import_keys(
                  "parent hash algorithm: %s",
                 tpm2_alg_util_algtostr(parent_pub->publicArea.nameAlg,
                         tpm2_alg_util_flags_hash));
-        public->publicArea.nameAlg = parent_pub->publicArea.nameAlg;
+        template->publicArea.nameAlg = parent_pub->publicArea.nameAlg;
     }
 
     /*
@@ -1379,7 +1284,7 @@ bool tpm2_openssl_import_keys(
      */
     if (encrypted_seed)
     {
-        TPM2B_DIGEST *seed = &private->sensitiveArea.seedValue;
+        TPM2B_DIGEST *seed = &out_private->sensitiveArea.seedValue;
         static const unsigned char label[] = { 'D', 'U', 'P', 'L', 'I', 'C', 'A', 'T', 'E', '\0' };
         result = tpm2_identity_util_share_secret_with_public_key(seed, parent_pub,
             label, sizeof(label), encrypted_seed);
@@ -1393,7 +1298,7 @@ bool tpm2_openssl_import_keys(
      * Populate all the private and public data fields we can based on the key type and the PEM files read in.
      */
     tpm2_openssl_load_rc status = tpm2_openssl_load_private(input_key_file,
-            auth_key_file, key_type, public, private);
+            passin, object_auth_value, template, out_public, out_private);
     if (status == lprc_error) {
         return false;
     }

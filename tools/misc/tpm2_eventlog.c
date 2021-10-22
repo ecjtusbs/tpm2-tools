@@ -76,32 +76,32 @@ static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
 
     /* Read the file in chunks.  Usually the file will reside in
        securityfs, and those files do not have a public file size */
-    tool_rc rc = tool_rc_success;
     FILE *fileptr = fopen(filename, "rb");
     if (!fileptr) {
         return tool_rc_general_error;
     }
 
     /* Reserve the buffer for the first chunk */
+    tool_rc rc = tool_rc_success;
     UINT8 *eventlog = calloc(1, CHUNK_SIZE);
     if (eventlog == NULL){
         LOG_ERR("failed to allocate %d bytes: %s", CHUNK_SIZE, strerror(errno));
-        return tool_rc_general_error;
+        rc = tool_rc_general_error;
+        goto out;
     }
 
-    unsigned long size = 0;
+    size_t size = 0;
     bool is_file_read = false;
     do {
-        is_file_read = files_read_bytes_chunk(fileptr, eventlog, CHUNK_SIZE, &size);
+        is_file_read = files_read_bytes_chunk(fileptr, eventlog + size, CHUNK_SIZE, &size);
         UINT8 *eventlog_tmp = realloc(eventlog, size + CHUNK_SIZE);
         if (!eventlog_tmp){
-            LOG_ERR("failed to allocate %lu bytes: %s", size + CHUNK_SIZE, strerror(errno));
+            LOG_ERR("failed to allocate %zu bytes: %s", size + CHUNK_SIZE, strerror(errno));
             rc = tool_rc_general_error;
             goto out;
         }
         eventlog = eventlog_tmp;
     } while (is_file_read);
-    fclose(fileptr);
 
     /* Parse eventlog data */
     bool ret = yaml_eventlog(eventlog, size, eventlog_version);
@@ -111,6 +111,10 @@ static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
     }
 
 out:
+    if (fileptr) {
+        fclose(fileptr);
+    }
+
     if (eventlog) {
         free(eventlog);
     }

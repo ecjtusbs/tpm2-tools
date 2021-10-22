@@ -69,11 +69,23 @@ create_authorized_policy() {
 # Restrict the value that can be set through tpm2 nvsetbits.
 create_authorized_policy
 tpm2 nvdefine 1 -a "policywrite|authwrite|ownerread|nt=bits" -L authorized.policy
+NV_INDEX_NAME=$(tpm2 nvreadpublic | grep name | awk {'print $2'})
+#
+# Suppose TPM2_NVDefine was not run and the name was entirely created external
+# to the TPM. Note: This support still needs to be added.
+#
+# To emulate the absence of NV index while calculating the cpHash of NV_SetBits,
+# let's Undefine the NV index and define it later.
+#
+tpm2 nvundefine 1 -C o
+# (1) Calculate the cpHash
+tpm2 nvsetbits 1 -i 1 --cphash cp.hash -n $NV_INDEX_NAME --tcti=none
 ## Create policycphash
-tpm2 nvsetbits 1 -i 1 --cphash cp.hash
 generate_policycphash
 ## Sign and verify policycphash
 sign_and_verify_policycphash
+# (3) Define the NV index and write some NV index data
+tpm2 nvdefine 1 -a "policywrite|authwrite|ownerread|nt=bits" -L authorized.policy
 ## Satisfy policycphash and execute nvsetbits
 setup_authorized_policycphash
 tpm2 nvsetbits 1 -i 1 -P "session:session.ctx"
@@ -93,9 +105,24 @@ tpm2 nvundefine 1
 # Test tpm2 nvextend
 create_authorized_policy
 tpm2 nvdefine 1 -a "nt=extend|ownerread|policywrite" -L authorized.policy
-echo "foo" | tpm2 nvextend -i- 1 --cphash cp.hash
+NV_INDEX_NAME=$(tpm2 nvreadpublic | grep name | awk {'print $2'})
+#
+# Suppose TPM2_NVDefine was not run and the name was entirely created external
+# to the TPM. Note: This support still needs to be added.
+#
+# To emulate the absence of NV index while calculating the cpHash of NV_SetBits,
+# let's Undefine the NV index and define it later.
+#
+tpm2 nvundefine 1 -C o
+# (1) Calculate the cpHash
+echo "foo" | tpm2 nvextend -i- 1 --cphash cp.hash -n $NV_INDEX_NAME --tcti=none
+## Create policycphash
 generate_policycphash
+## Sign and verify policycphash
 sign_and_verify_policycphash
+# (3) Define the NV index
+tpm2 nvdefine 1 -a "nt=extend|ownerread|policywrite" -L authorized.policy
+## Satisfy policycphash and execute nvsetbits
 setup_authorized_policycphash
 echo "foo" | tpm2 nvextend -i- 1 -P "session:session.ctx"
 tpm2 flushcontext session.ctx
@@ -124,24 +151,40 @@ tpm2 nvundefine 1
 
 # Test tpm2 nvread
 create_authorized_policy
-tpm2 nvdefine 1 -s 8 -a "ownerwrite|policyread" -L authorized.policy
-echo "foo" | tpm2 nvwrite 1 -i- -C o
-tpm2 nvread 1 -s 8 --cphash cp.hash
+tpm2 nvdefine 1 -a "ownerwrite|policyread" -L authorized.policy
+echo "some nv data" | tpm2 nvwrite 1 -i- -C o
+NV_INDEX_NAME=$(tpm2 nvreadpublic | grep name | awk {'print $2'})
+#
+# Suppose TPM2_NVDefine was not run and the name was entirely created external
+# to the TPM. Note: This support still needs to be added.
+#
+# To emulate the absence of NV index while calculating the cpHash of NVRead,
+# let's Undefine the NV index and define it later.
+#
+tpm2 nvundefine 1 -C o
+# (1) Calculate the cpHash
+tpm2 nvread 1 -s 4 --cphash cp.hash -n $NV_INDEX_NAME --tcti=none
+# (2) Calculate the policycphash
 generate_policycphash
 sign_and_verify_policycphash
+# (3) Define the NV index and write some NV index data
+tpm2 nvdefine 1 -a "ownerwrite|policyread" -L authorized.policy
+echo "some nv data" | tpm2 nvwrite 1 -i- -C o
+# (4)
 setup_authorized_policycphash
-tpm2 nvread 1 -s 8 -P "session:session.ctx" | xxd -p
+tpm2 nvread 1 -s 4 -P "session:session.ctx"
+tpm2 flushcontext session.ctx
 ## test the failing scenario
 setup_authorized_policycphash
 trap - ERR
-tpm2 nvread 1 -s 7 --offset 1 -P "session:session.ctx"
+tpm2 nvread 1 -s 8 --offset 1 -P "session:session.ctx"
 if [ $? == 0 ];then
   echo "ERROR: nvread must fail!"
   exit 1
 fi
 trap onerror ERR
 tpm2 flushcontext session.ctx
-tpm2 nvundefine 1
+tpm2 nvundefine 1 -C o
 
 # Test tpm2 nvreadlock
 create_authorized_policy
@@ -176,7 +219,8 @@ tpm2 flushcontext session.ctx
 tpm2 nvundefine 1
 
 # Test tpm2 nvdefine
-tpm2 nvdefine 1 -C o -s 32 -a "ownerread|ownerwrite" --cphash cp.hash
+tpm2 nvdefine 1 -C o -s 32 -a "ownerread|ownerwrite" --cphash cp.hash \
+  --tcti=none
 generate_policycphash
 setup_owner_policy
 tpm2 nvdefine 1 -C o -s 32 -a "ownerread|ownerwrite" -P "session:session.ctx"
@@ -638,17 +682,28 @@ tpm2 clockrateadjust s -p "session:session.ctx"
 tpm2 flushcontext session.ctx
 
 # Test nvwrite
- create_authorized_policy
- tpm2 nvdefine 1 -s 8 -a "ownerread|authwrite|policywrite" -L authorized.policy
- echo "foo" | tpm2 nvwrite 1 -i- --cphash cp.hash
- xxd -p cp.hash
- generate_policycphash
- sign_and_verify_policycphash
- setup_authorized_policycphash
- echo "foo" | tpm2 nvwrite 1 -i- -P "session:session.ctx"
- tpm2 flushcontext session.ctx
+create_authorized_policy
+tpm2 nvdefine 1 -s 8 -a "ownerread|authwrite|policywrite" -L authorized.policy
 
- # Test encryptdecrypt
+NV_INDEX_NAME=$(tpm2 nvreadpublic | grep name | awk {'print $2'})
+#
+# Suppose TPM2_NVDefine was not run and the name was entirely created external
+# to the TPM. Note: This support still needs to be added.
+#
+# To emulate the absence of NV index while calculating the cpHash of NVRead,
+# let's Undefine the NV index and define it later.
+#
+tpm2 nvundefine 1 -C o
+echo "foo" | tpm2 nvwrite 1 -i- -n $NV_INDEX_NAME --cphash cp.hash --tcti=none
+
+generate_policycphash
+sign_and_verify_policycphash
+tpm2 nvdefine 1 -s 8 -a "ownerread|authwrite|policywrite" -L authorized.policy
+setup_authorized_policycphash
+echo "foo" | tpm2 nvwrite 1 -i- -P "session:session.ctx"
+tpm2 flushcontext session.ctx
+
+# Test encryptdecrypt
 create_authorized_policy
 tpm2 createprimary -Q -C e -g sha1 -G rsa -c primary.ctx
 tpm2 create -Q -g sha256 -G aes -u key.pub -r key.priv -C primary.ctx \
